@@ -12,4 +12,5 @@ def main():
     print("the square is", square.remote(42))
 
 # run via
-# python3 -m modal run modal_test.py
+# modal run modal_test.py
+# inside uv venv
