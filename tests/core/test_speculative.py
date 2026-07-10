@@ -6,8 +6,10 @@ CUDA/a loaded model, only on token-id bookkeeping.
 from __future__ import annotations
 
 import pytest
+import torch
 
-from minisgl.scheduler.speculative import NgramIndex, compute_commit
+from minisgl.core import Req, SamplingParams
+from minisgl.scheduler.speculative import NgramIndex, SpeculativeConfig, _propose_draft, compute_commit
 
 
 class TestNgramIndex:
@@ -101,6 +103,73 @@ class TestComputeCommit:
         assert c == [1, 2, 9]
         # the emitted 3rd token (9) is exactly the target model's greedy choice, not
         # the (rejected) drafted token (3).
+
+
+def _make_decode_req(token_ids, cached_len, output_len):
+    """Build a Req in the "just entered decode" state: len(input_ids) == device_len
+    (the invariant held between rounds), with `cached_len` tokens already KV-cached
+    and the last element of `token_ids` the pending, not-yet-KV'd input token.
+    """
+    input_ids = torch.tensor(token_ids, dtype=torch.int32)
+    return Req(
+        input_ids=input_ids,
+        table_idx=0,
+        cached_len=cached_len,
+        output_len=output_len,
+        uid=0,
+        sampling_params=SamplingParams(temperature=0.0, max_tokens=output_len),
+        cache_handle=None,  # type: ignore[arg-type]  # _propose_draft never touches this
+    )
+
+
+class TestProposeDraftBudgetClamp:
+    """Regression coverage for the max_tokens overshoot bug: a fully-accepted draft
+    commits draft_len + 1 tokens (draft + bonus token), so draft_len must leave room
+    for that bonus token or a round can commit one token past max_tokens -- which
+    diverges from what a plain (0-draft) greedy round would have produced, exactly
+    the kind of mismatch check_ngram_correctness.py is meant to catch.
+    """
+
+    def test_draft_length_leaves_room_for_the_bonus_token(self):
+        # trailing 2-gram [1, 2] (positions 6-7) also occurred at positions 0-1, with
+        # a long continuation available ([3, 4, 5, 6, 1, 2]) -- long enough that an
+        # unclamped proposal would exceed the token budget on full acceptance.
+        token_ids = [1, 2, 3, 4, 5, 6, 1, 2]
+        req = _make_decode_req(token_ids, cached_len=7, output_len=4)
+        config = SpeculativeConfig(enabled=True, num_draft_tokens=8, min_match_len=2)
+
+        draft = _propose_draft(req, config)
+
+        assert len(draft) > 0, "test setup should exercise a genuine match"
+        # full acceptance would commit len(draft) + 1 tokens; that must never exceed
+        # remain_len (the number of new tokens still allowed from the current state).
+        assert len(draft) + 1 <= req.remain_len
+
+    def test_tightest_reachable_budget_forces_zero_draft(self):
+        # remain_len == 1 is the tightest state _propose_draft can ever observe (a
+        # request with remain_len <= 0 has already been filtered out of
+        # decode_manager.running_reqs and would never reach here). Even with a
+        # genuine match available, the round must degrade to a plain 1-token step.
+        token_ids = [1, 2, 3, 4, 5, 6, 1, 2]
+        req = _make_decode_req(token_ids, cached_len=7, output_len=1)
+        assert req.remain_len == 1
+        config = SpeculativeConfig(enabled=True, num_draft_tokens=8, min_match_len=2)
+
+        draft = _propose_draft(req, config)
+
+        assert draft == []
+
+    @pytest.mark.parametrize("output_len", [1, 2, 3, 4, 5, 6, 7, 8])
+    def test_never_overshoots_across_a_range_of_budgets(self, output_len):
+        token_ids = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2]
+        req = _make_decode_req(token_ids, cached_len=9, output_len=output_len)
+        if req.remain_len <= 0:
+            pytest.skip("unreachable state: request would already be finished")
+        config = SpeculativeConfig(enabled=True, num_draft_tokens=8, min_match_len=2)
+
+        draft = _propose_draft(req, config)
+
+        assert len(draft) + 1 <= req.remain_len
 
 
 if __name__ == "__main__":

@@ -74,7 +74,15 @@ class NgramIndex:
 def _propose_draft(req: Req, config: SpeculativeConfig) -> List[int]:
     if not req.sampling_params.is_greedy:
         return []
-    k_eff = min(config.num_draft_tokens, req.remain_len)
+    # A round commits up to draft_len + 1 tokens (full acceptance + bonus token). A
+    # plain (non-speculative) round stops once its single committed token brings
+    # cached_len to max_device_len - 1 -- i.e. at most `req.remain_len` *new* tokens
+    # may ever be committed from the current state, not remain_len + 1. So draft_len
+    # must be capped at remain_len - 1, leaving room for the mandatory bonus token;
+    # using `req.remain_len` here (off by one) would let a fully-accepted draft
+    # commit one token past max_tokens, diverging from what plain greedy decode (or a
+    # 0-draft round) would have produced.
+    k_eff = min(config.num_draft_tokens, req.remain_len - 1)
     if k_eff <= 0:
         return []
     if req.ngram_index is None:
