@@ -63,8 +63,32 @@ def _wait_for_server(proc: subprocess.Popen, port: int, timeout_s: float) -> Non
     raise TimeoutError(f"minisgl server did not become ready within {timeout_s:.0f}s")
 
 
+def _sync_to_latest_commit() -> str:
+    # The image's git clone is baked in at image-build time and then cached by
+    # Modal, so it can silently go stale relative to the branch on GitHub. Re-fetch
+    # and switch to the branch tip at call time so we always run the latest commit.
+    subprocess.run(
+        ["git", "fetch", "--depth", "1", "origin", "n_gram"],
+        cwd=REMOTE_ROOT,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "switch", "--detach", "FETCH_HEAD"],
+        cwd=REMOTE_ROOT,
+        check=True,
+    )
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=REMOTE_ROOT,
+        text=True,
+    ).strip()
+    print(f"synced {REMOTE_ROOT} to n_gram commit {commit}")
+    return commit
+
+
 @APP.function(image=image, gpu="H100!", timeout=2 * 60 * 60, volumes={CACHE_ROOT: CACHE})
 def run_benchmark(model: str = MODEL) -> str:
+    _sync_to_latest_commit()
     _configure_cache_env()
     env = os.environ.copy()
     env["PATH"] = f"{REMOTE_ROOT}/.venv/bin:" + env["PATH"]
