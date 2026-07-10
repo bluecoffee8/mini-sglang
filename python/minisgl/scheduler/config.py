@@ -17,6 +17,12 @@ class SchedulerConfig(EngineConfig):
     cache_type: str = "radix"
     offline_mode: bool = False
 
+    # N-gram speculative decoding (greedy-sampled requests only; non-greedy requests
+    # in the same batch transparently bypass speculation). "none" disables it.
+    speculative_algorithm: str = "none"
+    speculative_num_draft_tokens: int = 8
+    speculative_ngram_min_match: int = 3
+
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)
 

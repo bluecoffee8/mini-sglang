@@ -78,6 +78,16 @@ class CacheManager:
             req.cache_handle = new_handle
             self.lock(new_handle)
 
+    def free_pages(self, indices: torch.Tensor) -> None:
+        """Immediately return page-aligned physical indices to the free pool.
+
+        Used to reclaim over-allocated speculative-decoding KV pages (rejected draft
+        positions) right after the synchronous verify step, once we know the compute
+        that wrote to them has completed. Unlike `lazy_free_region`, this is not
+        deferred -- callers must only pass indices that are safe to reuse immediately.
+        """
+        self._free(indices)
+
     def check_integrity(self) -> None:
         self.prefix_cache.check_integrity()
         cache_pages = self.prefix_cache.size_info.total_size // self.page_size

@@ -35,6 +35,19 @@ class Req:
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
 
+    # ---- n-gram speculative decoding (greedy-only) transient per-round state ----
+    # Draft tokens proposed for the current decode round (empty = not speculating this round).
+    pending_draft: List[int] = field(default_factory=list, init=False)
+    # Raw per-position argmax predictions from the target model for this round's verify
+    # positions, stashed by Engine and consumed by Scheduler._verify_speculative.
+    spec_predicted: torch.Tensor | None = field(default=None, init=False)
+    # Tokens actually committed this round (draft prefix accepted + bonus token, possibly
+    # truncated at EOS/max_tokens), staged for Scheduler._process_last_data to report.
+    pending_committed_tokens: List[int] | None = field(default=None, init=False)
+    # Lazily-created NgramIndex (see scheduler/speculative.py); typed loosely to avoid a
+    # circular import between core.py and scheduler/.
+    ngram_index: object = field(default=None, init=False)
+
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
@@ -49,9 +62,13 @@ class Req:
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
 
+    def finalize_step(self, num_committed: int) -> None:
+        """Commit `num_committed` new tokens (<= extend_len) and prep for a plain 1-token step."""
+        self.cached_len += num_committed
+        self.device_len = self.cached_len + 1
+
     def complete_one(self) -> None:
-        self.cached_len = self.device_len
-        self.device_len += 1
+        self.finalize_step(self.extend_len)
 
     def append_host(self, next_token: torch.Tensor) -> None:
         self.input_ids = torch.cat([self.input_ids, next_token])
@@ -87,6 +104,11 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def has_speculative_rows(self) -> bool:
+        """True iff this is a decode batch with at least one multi-token verify request."""
+        return self.is_decode and any(r.extend_len > 1 for r in self.reqs)
 
     @property
     def size(self) -> int:

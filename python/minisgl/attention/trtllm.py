@@ -57,7 +57,12 @@ class TensorRTLLMBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
 
-        if batch.is_prefill:
+        # The decode-optimized kernel assumes exactly 1 query per request. A
+        # speculative-decoding verify batch is phase="decode" but scores >1 positions
+        # for some requests, so it must use the general context kernel instead (same
+        # kernel already used for ragged/chunked prefill). This only adds a new case;
+        # the two existing cases (prefill phase; plain 1-token decode) are unchanged.
+        if batch.is_prefill or metadata.max_seqlen_q > 1:
             return trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,

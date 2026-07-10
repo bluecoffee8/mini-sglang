@@ -101,7 +101,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        # NOTE: this must check the row count (not `bs` == number of requests): a
+        # speculative-decoding verify batch can have a single request that still
+        # scores multiple rows (>1 draft positions), so `bs == 1` no longer implies
+        # exactly one logit row.
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

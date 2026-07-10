@@ -221,7 +221,16 @@ class FlashInferBackend(BaseAttnBackend):
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
-            wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+            # The decode-optimized wrapper assumes exactly 1 query per request. A
+            # speculative-decoding verify batch is phase="decode" but scores >1
+            # positions for some requests (ragged, like chunked prefill), so it must
+            # use the general prefill wrapper instead. This only adds a new case; the
+            # two existing cases (prefill phase; plain 1-token decode) are unchanged.
+            wrapper=(
+                self.prefill_wrapper
+                if (not batch.is_decode) or max_seqlen_q > 1
+                else self.decode_wrappers
+            ),
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

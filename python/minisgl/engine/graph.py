@@ -147,7 +147,14 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        # Captured decode graphs assume exactly 1 query position per request; a
+        # speculative-decoding verify batch scores >1 positions for some requests, so
+        # it must always fall back to the eager (ragged-attention-capable) path.
+        return (
+            batch.is_decode
+            and batch.size <= self.max_graph_bs
+            and not batch.has_speculative_rows
+        )
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)

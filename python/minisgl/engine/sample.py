@@ -7,7 +7,7 @@ import torch
 from minisgl.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
-    from minisgl.core import Batch
+    from minisgl.core import Req
 
 
 @dataclass
@@ -50,8 +50,12 @@ class Sampler:
     device: torch.device
     vocab_size: int
 
-    def prepare(self, batch: Batch) -> BatchSamplingArgs:
-        params = [r.sampling_params for r in batch.reqs]
+    def prepare(self, reqs: List[Req]) -> BatchSamplingArgs:
+        """Build sampling args for a list of requests that each contribute exactly one
+        logit row, in the given order. Callers are responsible for excluding requests
+        that contribute more than one row (e.g. speculative-decoding verify rows),
+        which are sampled separately via exact per-row argmax instead."""
+        params = [r.sampling_params for r in reqs]
         if all(p.is_greedy for p in params):
             return BatchSamplingArgs(temperatures=None)
 

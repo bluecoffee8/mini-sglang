@@ -196,10 +196,61 @@ class Engine:
             else:
                 logits = self.model.forward()
 
+        if batch.has_speculative_rows:
+            return self._forward_speculative_rows(batch, logits, args)
+
         for req in batch.reqs:
             req.complete_one()
 
         next_tokens_gpu = self.sampler.sample(logits[: batch.size], args).to(torch.int32)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _forward_speculative_rows(
+        self, batch: Batch, logits: torch.Tensor, args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        """Decode-phase forward where some requests scored >1 position this round
+        (n-gram speculative verify). `logits` has one row per scored *position*, laid
+        out as contiguous per-request blocks of size `req.extend_len`, in `batch.reqs`
+        order (verify batches never use CUDA graph padding, so `batch.padded_reqs ==
+        batch.reqs`). Requests with extend_len==1 are sampled exactly as in the
+        non-speculative path; requests with extend_len>1 always come from a greedy
+        request (see speculative.py), so we use exact per-row argmax -- the target
+        model's own greedy choice is both the acceptance criterion and the emitted
+        token, guaranteeing speculation never changes what a greedy request generates.
+        """
+        row_lens = [r.extend_len for r in batch.reqs]
+        offsets = [0] * (len(row_lens) + 1)
+        for i, length in enumerate(row_lens):
+            offsets[i + 1] = offsets[i] + length
+
+        normal_positions = [i for i, length in enumerate(row_lens) if length == 1]
+        spec_positions = [i for i, length in enumerate(row_lens) if length > 1]
+
+        next_tokens_gpu = torch.zeros(batch.size, dtype=torch.int32, device=logits.device)
+        if normal_positions:
+            normal_row_idx = torch.tensor(
+                [offsets[i] for i in normal_positions], dtype=torch.int64, device=logits.device
+            )
+            normal_tokens = self.sampler.sample(logits[normal_row_idx], args).to(torch.int32)
+            dst_idx = torch.tensor(normal_positions, dtype=torch.int64, device=logits.device)
+            next_tokens_gpu[dst_idx] = normal_tokens
+            for i in normal_positions:
+                batch.reqs[i].complete_one()
+
+        for i in spec_positions:
+            req = batch.reqs[i]
+            block = logits[offsets[i] : offsets[i + 1]]
+            req.spec_predicted = torch.argmax(block, dim=-1)
+        # NOTE: req.device_len/cached_len for spec rows are finalized later by
+        # Scheduler._verify_speculative, once the argmax predictions above are
+        # compared against the drafted tokens (accept length isn't known yet here).
+        # The corresponding slots in next_tokens_gpu are unused placeholders: the
+        # scheduler routes those requests' write-back to a scratch location (see
+        # _make_write_tuple) and writes their real next-input token itself.
+
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)

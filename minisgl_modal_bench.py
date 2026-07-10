@@ -87,7 +87,13 @@ def _sync_to_latest_commit() -> str:
 
 
 @APP.function(image=image, gpu="H100!", timeout=2 * 60 * 60, volumes={CACHE_ROOT: CACHE})
-def run_benchmark(model: str = MODEL) -> str:
+def run_benchmark(
+    model: str = MODEL,
+    speculative: bool = False,
+    num_draft_tokens: int = 8,
+    ngram_min_match: int = 3,
+    num_requests: int = 100,
+) -> str:
     _sync_to_latest_commit()
     _configure_cache_env()
     env = os.environ.copy()
@@ -109,21 +115,41 @@ def run_benchmark(model: str = MODEL) -> str:
         # the scheduler subprocess silently. Force flashinfer to avoid that path.
         "--attention-backend",
         "fi",
-    ]    
-    print(f"starting minisgl server: {' '.join(server_cmd)}")
+    ]
+    if speculative:
+        server_cmd += [
+            "--speculative-algorithm",
+            "ngram",
+            "--speculative-num-draft-tokens",
+            str(num_draft_tokens),
+            "--speculative-ngram-min-match",
+            str(ngram_min_match),
+        ]
+    mode = (
+        f"n-gram speculative decoding (k={num_draft_tokens}, n={ngram_min_match})"
+        if speculative
+        else "baseline (no speculation)"
+    )
+    print(f"starting minisgl server [{mode}]: {' '.join(server_cmd)}")
     server = subprocess.Popen(server_cmd, cwd=REMOTE_ROOT, env=env)
     try:
         _wait_for_server(server, PORT, SERVER_STARTUP_TIMEOUT_S)
 
-        print("starting benchmark/online/bench_qwen.py")
-        client = subprocess.run(
-            [python_bin, "benchmark/online/bench_qwen.py"],
-            cwd=REMOTE_ROOT,
-            env=env,
-        )
+        print(f"starting benchmark/online/bench_qwen.py [{mode}]")
+        client_cmd = [
+            python_bin,
+            "benchmark/online/bench_qwen.py",
+            "--port",
+            str(PORT),
+            "--num-requests",
+            str(num_requests),
+        ]
+        if speculative:
+            client_cmd.append("--speculative")
+        client = subprocess.run(client_cmd, cwd=REMOTE_ROOT, env=env)
         if client.returncode:
             raise RuntimeError(f"bench_qwen.py failed with exit code {client.returncode}")
-        return "benchmark completed successfully"
+        return f"benchmark completed successfully [{mode}]"
     finally:
         server.terminate()
         try:
@@ -134,7 +160,23 @@ def run_benchmark(model: str = MODEL) -> str:
 
 
 @APP.local_entrypoint()
-def main(model: str = MODEL) -> None:
-    print(run_benchmark.remote(model))
+def main(
+    model: str = MODEL,
+    speculative: bool = False,
+    num_draft_tokens: int = 8,
+    ngram_min_match: int = 3,
+    num_requests: int = 100,
+) -> None:
+    print(
+        run_benchmark.remote(
+            model=model,
+            speculative=speculative,
+            num_draft_tokens=num_draft_tokens,
+            ngram_min_match=ngram_min_match,
+            num_requests=num_requests,
+        )
+    )
 
 # modal run minisgl_modal_bench.py
+# modal run minisgl_modal_bench.py --speculative
+# modal run minisgl_modal_bench.py --speculative --num-draft-tokens 16 --ngram-min-match 4

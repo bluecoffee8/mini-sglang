@@ -223,6 +223,33 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="Run the server in shell mode.",
     )
 
+    parser.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        default=ServerArgs.speculative_algorithm,
+        choices=["none", "ngram"],
+        help="Speculative decoding algorithm. 'ngram' enables n-gram (prompt-lookup) "
+        "speculative decoding: draft tokens are proposed from a previous occurrence of "
+        "the request's own trailing tokens. Only applies to greedy-sampled requests; "
+        "non-greedy requests transparently bypass speculation.",
+    )
+
+    parser.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=ServerArgs.speculative_num_draft_tokens,
+        help="Maximum number of draft tokens (k) proposed per speculative decoding step; "
+        "the target model scores k+1 positions per step.",
+    )
+
+    parser.add_argument(
+        "--speculative-ngram-min-match",
+        type=int,
+        default=ServerArgs.speculative_ngram_min_match,
+        help="Number of trailing tokens (n) used to look up a previous occurrence in a "
+        "request's own history for n-gram speculative decoding.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 

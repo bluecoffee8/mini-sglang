@@ -13,13 +13,14 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
-from minisgl.utils import init_logger, load_tokenizer
+from minisgl.utils import align_ceil, init_logger, load_tokenizer
 
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
+from .speculative import SpeculativeConfig, compute_commit, prepare_speculative_batch
 from .table import TableManager
 
 if TYPE_CHECKING:
@@ -70,6 +71,11 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self.spec_config = SpeculativeConfig(
+            enabled=config.speculative_algorithm != "none",
+            num_draft_tokens=config.speculative_num_draft_tokens,
+            min_match_len=config.speculative_ngram_min_match,
+        )
         # self.config = config
 
         # Initialize the I/O mixin
@@ -119,7 +125,12 @@ class Scheduler(SchedulerIOMixin):
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        # N-gram speculative decoding needs each round's actual accept length before
+        # the next round can be scheduled correctly (KV-cache paging, running_reqs
+        # membership, etc. all depend on it), which overlap scheduling can't provide
+        # since it schedules round N+1 before round N's results are processed. Force
+        # the synchronous loop whenever speculative decoding is enabled.
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.spec_config.enabled:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -147,13 +158,31 @@ class Scheduler(SchedulerIOMixin):
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                finished = not req.can_decode
-                if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+
+                if req.pending_committed_tokens is not None:
+                    # Speculative-decoding verify round: 1..k+1 tokens were already
+                    # committed (cached_len/device_len finalized, append_host done) by
+                    # _verify_speculative; here we only need to report them.
+                    committed = req.pending_committed_tokens
+                    req.pending_committed_tokens = None
+                    finished = not req.can_decode
+                    if not req.sampling_params.ignore_eos:
+                        finished |= committed[-1] == self.eos_token_id
+                    for j, tok in enumerate(committed):
+                        is_last = j == len(committed) - 1
+                        reply.append(
+                            DetokenizeMsg(uid=req.uid, next_token=tok, finished=finished and is_last)
+                        )
+                else:
+                    next_token = next_tokens_cpu[i]
+                    req.append_host(next_token.unsqueeze(0))
+                    next_token = int(next_token.item())
+                    finished = not req.can_decode
+                    if not req.sampling_params.ignore_eos:
+                        finished |= next_token == self.eos_token_id
+                    reply.append(
+                        DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished)
+                    )
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -209,28 +238,106 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        # Prefill requests always contribute exactly 1 logit row regardless of
+        # extend_len (ParallelLMHead gathers the last position). Decode requests
+        # contribute `extend_len` rows each; speculative-decoding verify rows
+        # (extend_len > 1) are sampled separately via exact argmax in the engine, so
+        # they're excluded here.
+        sample_reqs = (
+            batch.reqs if batch.is_prefill else [r for r in batch.reqs if r.extend_len == 1]
+        )
         return ForwardInput(
             batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
+            sample_args=self.engine.sampler.prepare(sample_reqs),
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+        if batch is None:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None and self.spec_config.enabled:
+                prepare_speculative_batch(batch, self.spec_config, self.token_pool, self.device)
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        if batch.has_speculative_rows:
+            # Must finalize cached_len/device_len for speculating requests before
+            # filter_reqs (right below) reads req.can_decode for the next round.
+            self._verify_speculative(batch)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    def _verify_speculative(self, batch: Batch) -> None:
+        """Apply the greedy speculative-sampling acceptance rule to every request that
+        scored >1 position this round, commit the accepted tokens (+ bonus/correction
+        token), and reclaim the KV-cache pages that were spent on rejected positions.
+        """
+        spec_reqs = [r for r in batch.reqs if r.extend_len > 1]
+        if not spec_reqs:
+            return
+
+        page_size = self.cache_manager.page_size
+        page_table = self.table_manager.page_table
+        write_idx: List[int] = []
+        write_pos: List[int] = []
+        write_val: List[int] = []
+        free_chunks: List[torch.Tensor] = []
+
+        for req in spec_reqs:
+            assert req.spec_predicted is not None
+            predicted: List[int] = req.spec_predicted.tolist()
+            req.spec_predicted = None
+            draft = req.pending_draft
+            req.pending_draft = []
+
+            committed = compute_commit(
+                draft, predicted, self.eos_token_id, req.sampling_params.ignore_eos
+            )
+            speculative_device_len = req.device_len  # over-allocated extend, pre-verify
+            req.finalize_step(len(committed))
+            req.append_host(torch.tensor(committed, dtype=torch.int32))
+            req.pending_committed_tokens = committed
+
+            if req.can_decode:
+                write_idx.append(req.table_idx)
+                write_pos.append(req.cached_len)
+                write_val.append(committed[-1])
+
+            # Free the (page-aligned) tail of KV pages spent on positions beyond what
+            # was actually committed. `free_from` rounds up to the first page fully
+            # beyond the committed length, so a page straddling the accept boundary is
+            # conservatively kept (harmless, bounded waste of <page_size tokens).
+            # `free_to` must round UP (not down, and not left as the raw, possibly
+            # unaligned `speculative_device_len`) to match the page-aligned extent
+            # `allocate_paged` actually reserved -- `CacheManager.free_pages` extracts
+            # one page-start per page_size-sized run of its input, so passing a
+            # partial/misaligned page here would misidentify a page that's still
+            # partly in use as fully free and hand it out to another request.
+            free_from = align_ceil(req.cached_len, page_size)
+            free_to = align_ceil(speculative_device_len, page_size)
+            if free_from < free_to:
+                free_chunks.append(page_table[req.table_idx, free_from:free_to])
+
+        if write_idx:
+            idx_t = torch.tensor(write_idx, dtype=torch.int64, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+            pos_t = torch.tensor(write_pos, dtype=torch.int64, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+            val_t = torch.tensor(write_val, dtype=torch.int32, pin_memory=True).to(
+                self.device, non_blocking=True
+            )
+            self.token_pool[idx_t, pos_t] = val_t
+        if free_chunks:
+            self.cache_manager.free_pages(torch.cat(free_chunks))
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
@@ -262,6 +369,13 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
-    write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
+    # Speculative-decoding verify rows (decode phase, extend_len > 1) don't know their
+    # real next-input write position until Scheduler._verify_speculative determines
+    # the accept length, so route them to the same -1 scratch sentinel used for
+    # finished requests; _verify_speculative writes their token itself afterward.
+    write_list = [
+        (req.device_len if (req.can_decode and not (batch.is_decode and req.extend_len > 1)) else -1)
+        for req in batch.reqs
+    ]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
