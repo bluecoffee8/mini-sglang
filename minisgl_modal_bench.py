@@ -70,7 +70,22 @@ def run_benchmark(model: str = MODEL) -> str:
     env["PATH"] = f"{REMOTE_ROOT}/.venv/bin:" + env["PATH"]
     python_bin = f"{REMOTE_ROOT}/.venv/bin/python"
 
-    server_cmd = [python_bin, "-m", "minisgl", "--model", model, "--port", str(PORT)]
+    server_cmd = [
+        python_bin,
+        "-m",
+        "minisgl",
+        "--model",
+        model,
+        "--port",
+        str(PORT),
+        # "auto" resolves to hybrid "fa,fi" on H100 (sm90), and importing the "fa"
+        # backend's sgl_kernel.flash_attn module unconditionally pulls in a
+        # flash_attn_origin.cute/cutlass-dsl import chain that crashes at import
+        # time in this environment (cutlass/sgl_kernel version mismatch), killing
+        # the scheduler subprocess silently. Force flashinfer to avoid that path.
+        "--attention-backend",
+        "fi",
+    ]    
     print(f"starting minisgl server: {' '.join(server_cmd)}")
     server = subprocess.Popen(server_cmd, cwd=REMOTE_ROOT, env=env)
     try:
