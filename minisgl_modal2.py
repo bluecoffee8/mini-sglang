@@ -16,8 +16,8 @@ APP = modal.App("minisgl-ngram2")
 
 CACHE_ROOT = "/mnt/mini-sglang-cache2"
 CACHE = modal.Volume.from_name(
-    "mini-sglang-cache2", environment_name="worktrials"
-).read_only()
+    "mini-sglang-cache2",
+)
 MINI_REMOTE_ROOT = "/root/mini-sglang"
 
 OUTPUT_DIR = Path("/private/tmp/mini_main_qwen3-8_test")
