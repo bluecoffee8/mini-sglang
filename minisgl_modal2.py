@@ -421,7 +421,7 @@ def _build_summary(raw: dict[str, Any]) -> dict[str, Any]:
 def _run_mini_mode(speculative: bool) -> str:
     _configure_cache_env()
     subprocess.run(
-        ["git", "fetch", "--depth", "1", "origin", "codex/ngram-speculative"],
+        ["git", "fetch", "--depth", "1", "origin", "n_gram"],
         cwd=MINI_REMOTE_ROOT,
         check=True,
     )
@@ -457,25 +457,46 @@ def _run_mini_mode(speculative: bool) -> str:
     )
     command = [
         f"{MINI_REMOTE_ROOT}/.venv/bin/python",
-        "tests/integration/test_ngram_speculative_numerics.py",
-        "--worker",
-        "speculative" if speculative else "baseline",
-        "--cases",
-        str(cases_path),
-        "--result",
-        str(result_path),
-        "--max-input-tokens",
-        str(MAX_INPUT_TOKENS),
-        "--max-output-tokens",
-        str(MAX_OUTPUT_TOKENS),
-        "--batch-size",
-        str(BATCH_SIZE),
-        "--ignore-eos",
-        "0",
+        "benchmark/online/bench_qwen.py",
+        # "--worker",
+        # "speculative" if speculative else "baseline",
+        # "--cases",
+        # str(cases_path),
+        # "--result",
+        # str(result_path),
+        # "--max-input-tokens",
+        # str(MAX_INPUT_TOKENS),
+        # "--max-output-tokens",
+        # str(MAX_OUTPUT_TOKENS),
+        # "--batch-size",
+        # str(BATCH_SIZE),
+        # "--ignore-eos",
+        # "0",
     ]
+    server_command = [
+        f"{MINI_REMOTE_ROOT}/.venv/bin/python",
+        "-m",
+        "minisgl",
+        "--model", 
+        f"{MODEL}",
+        "--port 1919",
+    ]
+    client_command = [
+        f"{MINI_REMOTE_ROOT}/.venv/bin/python",
+        "benchmark/online/bench_qwen.py",
+    ]
+    server_start = subprocess.run(
+        server_command,
+        cwd=MINI_REMOTE_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    time.sleep(60) # wait for server to start 
     started = time.time()
     completed = subprocess.run(
-        command,
+        client_command,
         cwd=MINI_REMOTE_ROOT,
         env=env,
         text=True,
