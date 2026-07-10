@@ -21,16 +21,30 @@ logger = init_logger(__name__)
 URL = "https://media.githubusercontent.com/media/alibaba-edu/qwen-bailian-usagetraces-anon/refs/heads/main/qwen_traceA_blksz_16.jsonl"
 
 
-def download_qwen_trace(url: str) -> str:
+def download_qwen_trace(url: str, retries: int = 5) -> str:
     dir = Path(os.path.dirname(__file__))
     # download the file if not exists
     file_path = dir / "qwen_traceA_blksz_16.jsonl"
     if not file_path.exists():
+        import urllib.error
         import urllib.request
 
+        tmp_path = file_path.with_suffix(file_path.suffix + ".part")
         logger.info(f"Downloading trace from {url} to {file_path}...")
-        urllib.request.urlretrieve(url, file_path)
-        logger.info("Download completed.")
+        last_error: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                urllib.request.urlretrieve(url, tmp_path)
+                tmp_path.rename(file_path)
+                logger.info("Download completed.")
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                last_error = e
+                logger.warning(f"Download attempt {attempt}/{retries} failed: {e}")
+                tmp_path.unlink(missing_ok=True)
+        else:
+            assert last_error is not None
+            raise last_error
     return str(file_path)
 
 
