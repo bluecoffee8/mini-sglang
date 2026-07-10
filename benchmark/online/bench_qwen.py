@@ -51,7 +51,7 @@ def download_qwen_trace(url: str, retries: int = 5) -> str:
 async def main():
     random.seed(42)  # reproducibility
     PORT = 1919
-    N = 1000
+    N = 100
     # SCALES = [0.4, 0.5, 0.6, 0.7, 0.8, 1.6]  # from fast to slow
     SCALES = [0.4, 1.6]
     async with OpenAI(base_url=f"http://127.0.0.1:{PORT}/v1", api_key="dummy") as client:
